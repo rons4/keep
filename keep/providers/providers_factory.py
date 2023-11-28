@@ -286,11 +286,12 @@ class ProvidersFactory:
         tenant_id: str,
         all_providers: list[Provider] | None = None,
         include_details: bool = True,
+        provider_type: str | None = None,
     ) -> list[Provider]:
         if all_providers is None:
             all_providers = ProvidersFactory.get_all_providers()
 
-        installed_providers = get_installed_providers(tenant_id)
+        installed_providers = get_installed_providers(tenant_id, provider_type)
         providers = []
         context_manager = ContextManager(tenant_id=tenant_id)
         secret_manager = SecretManagerFactory.get_secret_manager(context_manager)

@@ -1,6 +1,9 @@
 import base64
 import json
 import logging
+import os
+import shutil
+import subprocess
 import zlib
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -55,8 +58,10 @@ def __send_compressed_alerts(
     )
 
 
-def get_alerts_from_providers_async(tenant_id: str, pusher_client: Pusher):
+def _get_alerts_from_providers(tenant_id: str, pusher_client: Pusher = None):
+    # TODO: this should be done in a more elegant way
     all_providers = ProvidersFactory.get_all_providers()
+    all_alerts = []
     context_manager = ContextManager(
         tenant_id=tenant_id,
         workflow_id=None,
@@ -127,44 +132,46 @@ def get_alerts_from_providers_async(tenant_id: str, pusher_client: Pusher):
                         "tenant_id": tenant_id,
                     },
                 )
+                if pusher_client:
+                    logger.info("Batch sending pulled alerts via pusher")
+                    batch_send = []
+                    previous_compressed_batch = ""
+                    new_compressed_batch = ""
+                    number_of_alerts_in_batch = 0
+                    # tb: this might be too slow in the future and we might need to refactor
+                    for alert in alerts:
+                        alert_dict = alert.dict()
+                        batch_send.append(alert_dict)
+                        new_compressed_batch = base64.b64encode(
+                            zlib.compress(json.dumps(batch_send).encode(), level=9)
+                        ).decode()
+                        if len(new_compressed_batch) <= 10240:
+                            number_of_alerts_in_batch += 1
+                            previous_compressed_batch = new_compressed_batch
+                        else:
+                            __send_compressed_alerts(
+                                previous_compressed_batch,
+                                number_of_alerts_in_batch,
+                                tenant_id,
+                                pusher_client,
+                            )
+                            batch_send = [alert_dict]
+                            new_compressed_batch = ""
+                            number_of_alerts_in_batch = 1
 
-                logger.info("Batch sending pulled alerts via pusher")
-                batch_send = []
-                previous_compressed_batch = ""
-                new_compressed_batch = ""
-                number_of_alerts_in_batch = 0
-                # tb: this might be too slow in the future and we might need to refactor
-                for alert in alerts:
-                    alert_dict = alert.dict()
-                    batch_send.append(alert_dict)
-                    new_compressed_batch = base64.b64encode(
-                        zlib.compress(json.dumps(batch_send).encode(), level=9)
-                    ).decode()
-                    if len(new_compressed_batch) <= 10240:
-                        number_of_alerts_in_batch += 1
-                        previous_compressed_batch = new_compressed_batch
-                    else:
+                    # this means we didn't get to this ^ else statement and loop ended
+                    #   so we need to send the rest of the alerts
+                    if new_compressed_batch and len(new_compressed_batch) < 10240:
                         __send_compressed_alerts(
-                            previous_compressed_batch,
+                            new_compressed_batch,
                             number_of_alerts_in_batch,
                             tenant_id,
                             pusher_client,
                         )
-                        batch_send = [alert_dict]
-                        new_compressed_batch = ""
-                        number_of_alerts_in_batch = 1
-
-                # this means we didn't get to this ^ else statement and loop ended
-                #   so we need to send the rest of the alerts
-                if new_compressed_batch and len(new_compressed_batch) < 10240:
-                    __send_compressed_alerts(
-                        new_compressed_batch,
-                        number_of_alerts_in_batch,
-                        tenant_id,
-                        pusher_client,
-                    )
-
-                logger.info("Sent batch of pulled alerts via pusher")
+                    logger.info("Sent batch of pulled alerts via pusher")
+                # backward compatibility for CLI
+                else:
+                    all_alerts.extend(alerts)
             logger.info(
                 f"Pulled alerts from provider {provider.type} ({provider.id}) (alerts: {len(alerts)})",
                 extra={
@@ -183,8 +190,20 @@ def get_alerts_from_providers_async(tenant_id: str, pusher_client: Pusher):
                 },
             )
             pass
+    if not pusher_client:
+        return all_alerts
     pusher_client.trigger(f"private-{tenant_id}", "async-done", {})
     logger.info("Asyncronusly fetched alerts from installed providers")
+
+
+def _get_alerts_from_db(tenant_id):
+    db_alerts = get_alerts_from_db(tenant_id=tenant_id)
+    # enrich the alerts with the enrichment data
+    for alert in db_alerts:
+        if alert.alert_enrichment:
+            alert.event.update(alert.alert_enrichment.enrichments)
+    alerts = [AlertDto(**alert.event) for alert in db_alerts]
+    return alerts
 
 
 @router.get(
@@ -202,12 +221,7 @@ def get_all_alerts(
             "tenant_id": tenant_id,
         },
     )
-    db_alerts = get_alerts_from_db(tenant_id=tenant_id)
-    # enrich the alerts with the enrichment data
-    for alert in db_alerts:
-        if alert.alert_enrichment:
-            alert.event.update(alert.alert_enrichment.enrichments)
-    alerts = [AlertDto(**alert.event) for alert in db_alerts]
+    alerts = _get_alerts_from_db(tenant_id)
     logger.info(
         "Fetched alerts from DB",
         extra={
@@ -215,7 +229,7 @@ def get_all_alerts(
         },
     )
     logger.info("Adding task to fetch async alerts from providers")
-    background_tasks.add_task(get_alerts_from_providers_async, tenant_id, pusher_client)
+    background_tasks.add_task(_get_alerts_from_providers, tenant_id, pusher_client)
     logger.info("Added task to async fetch alerts from providers")
     return alerts
 
@@ -461,6 +475,7 @@ async def receive_event(
     description="Get alert by fingerprint",
 )
 def get_alert(
+    background_tasks: BackgroundTasks,
     fingerprint: str,
     tenant_id: str = Depends(verify_token_or_key),
     session: Session = Depends(get_session),
@@ -473,12 +488,14 @@ def get_alert(
         },
     )
     # TODO: once pulled alerts will be in the db too, this should be changed
-    all_alerts = get_all_alerts(tenant_id=tenant_id)
+    pushed_alerts = _get_alerts_from_db(tenant_id=tenant_id)
+    pulled_alerts = _get_alerts_from_providers(tenant_id=tenant_id)
+    all_alerts = pushed_alerts + pulled_alerts
     alert = list(filter(lambda alert: alert.fingerprint == fingerprint, all_alerts))
     if alert:
         return alert[0]
     else:
-        return HTTPException(status_code=404, detail="Alert not found")
+        raise HTTPException(status_code=404, detail="Alert not found")
 
 
 @router.post(
@@ -513,3 +530,92 @@ def enrich_alert(
     except Exception as e:
         logger.exception("Failed to enrich alert", extra={"error": str(e)})
         return {"status": "failed"}
+
+
+@router.get(
+    "/{provider_type}/{alert_id}/terraform",
+    description="Get alert terraform definition",
+)
+def get_alert_terraform(
+    alert_id: str,
+    # TODO: support provider_id instead of provider_type (the problem is that when alert is pushed, we don't have the provider_id but only the type)
+    provider_type: str,
+    tenant_id: str = Depends(verify_token_or_key),
+    session: Session = Depends(get_session),
+) -> dict:
+    # TODO: more than one source
+    provider = ProvidersFactory.get_installed_providers(
+        tenant_id=tenant_id, provider_type=provider_type
+    )
+    if len(provider) == 0:
+        logger.error(f"Provider {provider_type} is not installed")
+        return {"error": "Provider is not installed"}
+    # TODO: support more than one provider within the same type
+    #       the problem is that the alert doesn't have correlation for the provider id
+    #       (for more context, Shahar)
+    elif len(provider) > 1:
+        logger.error(f"More than one provider of type {provider_type} is installed")
+        return {"error": "More than one provider of type is installed"}
+    # init the provider itself
+    provider = ProvidersFactory.get_provider(
+        context_manager=ContextManager(tenant_id=tenant_id),
+        provider_id=provider[0].id,
+        provider_type=provider_type,
+        provider_config=provider[0].details,
+    )
+    provider_terraformer_args = provider.get_terraformer_args(alert_id)
+
+    if not provider_terraformer_args:
+        logger.error(f"Provider {provider_type} doesn't support Terraformer")
+        return {"error": "Provider doesn't support Terraformer"}
+
+    # TODO: maybe add TerraformerArgs or something
+    terraformer_filter = provider_terraformer_args.get("filter")
+    terraform_auth = provider_terraformer_args.get("auth")
+    terraform_resource_type = provider_terraformer_args.get("resource")
+
+    if not terraformer_filter or not terraform_auth or not terraform_resource_type:
+        logger.error(f"Provider {provider_type} doesn't support Terraformer")
+        return {"error": "Provider doesn't support Terraformer"}
+
+    tmp_output_dir = f"/tmp/terraformer_output_{alert_id}"
+    os.makedirs(tmp_output_dir, exist_ok=True)
+    cmd = [
+        "terraformer",
+        "import",
+        f"{provider_type}",
+        f"--resources={terraform_resource_type}",
+        f'--filter="{terraformer_filter}"',
+        f"--path-output={tmp_output_dir}",
+    ]
+    # add the auth args
+    for auth in terraform_auth:
+        cmd.append(f"{auth}={terraform_auth[auth]}")
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        logger.error(f"Terraformer error: {stderr.decode('utf-8')}")
+        raise HTTPException(status_code=500, detail="Terraformer error")
+
+    if "404 Not Found" in stdout.decode("utf-8"):
+        logger.error(f"Terraformer error: {stderr.decode('utf-8')}")
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+    # get the monitor
+    with open(
+        f"{tmp_output_dir}/{provider_type}/{terraform_resource_type}/{terraform_resource_type}.tf",
+        "r",
+    ) as f:
+        terraform_definition = f.read()
+    # Cleanup the temporary directory
+    shutil.rmtree(tmp_output_dir)
+
+    logger.info(
+        "Fetching alert terraform definition",
+        extra={
+            "alert_id": alert_id,
+            "tenant_id": tenant_id,
+        },
+    )
+    return {"terraform_definition": terraform_definition}

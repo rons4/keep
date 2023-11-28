@@ -447,3 +447,12 @@ class BaseProvider(metaclass=abc.ABCMeta):
             self.logger.error(
                 f"Failed to push alert to {self.provider_id}: {response.content}"
             )
+
+    def get_terraformer_args(self, alert_id):
+        """
+        Get the terraformer args for the provider.
+
+        Returns:
+            dict: The terraformer args for the provider.
+        """
+        return {}

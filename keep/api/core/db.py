@@ -435,12 +435,21 @@ def get_raw_workflow(tenant_id: str, workflow_id: str) -> str:
     return workflow.workflow_raw
 
 
-def get_installed_providers(tenant_id: str) -> List[Provider]:
+def get_installed_providers(
+    tenant_id: str, provider_type: str = None
+) -> List[Provider]:
     with Session(engine) as session:
-        providers = session.exec(
-            select(Provider).where(Provider.tenant_id == tenant_id)
-        ).all()
-    return providers
+        # Start building the query
+        query = select(Provider).where(Provider.tenant_id == tenant_id)
+
+        # Add the provider_type filter if it is provided
+        if provider_type:
+            query = query.where(Provider.type == provider_type)
+
+        # Execute the query and fetch the results
+        providers = session.execute(query).scalars().all()
+
+        return providers
 
 
 def get_consumer_providers() -> List[Provider]:

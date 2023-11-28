@@ -138,9 +138,14 @@ class CustomizedUvicornLogger(logging.Logger):
         while frame:
             found_frame = False
             if frame.f_code.co_name == "run_asgi":
-                trace_id = (
-                    frame.f_locals.get("self").scope.get("state", {}).get("trace_id", 0)
-                )
+                try:
+                    trace_id = (
+                        frame.f_locals.get("self")
+                        .scope.get("state", {})
+                        .get("trace_id", 0)
+                    )
+                except AttributeError:
+                    trace_id = None
                 tenant_id = (
                     frame.f_locals.get("self")
                     .scope.get("state", {})

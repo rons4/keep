@@ -689,6 +689,16 @@ class DatadogProvider(BaseProvider):
     def get_alert_schema():
         return DatadogAlertFormatDescription.schema()
 
+    def get_terraformer_args(self, alert_id: str | None = None):
+        return {
+            "filter": f"monitor={alert_id}",
+            "auth": {
+                "--app-key": self.authentication_config.app_key,
+                "--api-key": self.authentication_config.api_key,
+            },
+            "resource": "monitor",
+        }
+
 
 if __name__ == "__main__":
     # Output debug messages
