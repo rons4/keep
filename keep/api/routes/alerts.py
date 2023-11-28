@@ -7,6 +7,7 @@ import subprocess
 import zlib
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pusher import Pusher
 from sqlmodel import Session
 
@@ -16,6 +17,7 @@ from keep.api.core.db import get_enrichments as get_enrichments_from_db
 from keep.api.core.db import get_session
 from keep.api.core.dependencies import (
     get_pusher_client,
+    get_user_email,
     verify_api_key,
     verify_bearer_token,
     verify_token_or_key,
@@ -58,8 +60,11 @@ def __send_compressed_alerts(
     )
 
 
-def _get_alerts_from_providers(tenant_id: str, pusher_client: Pusher = None):
-    # TODO: this should be done in a more elegant way
+def pull_alerts_from_providers(
+    tenant_id: str, pusher_client: Pusher | None, sync: bool = False
+) -> list[AlertDto] | None:
+    if pusher_client is None and sync is False:
+        raise HTTPException(500, "Cannot pull alerts async when pusher is disabled.")
     all_providers = ProvidersFactory.get_all_providers()
     all_alerts = []
     context_manager = ContextManager(
@@ -69,7 +74,10 @@ def _get_alerts_from_providers(tenant_id: str, pusher_client: Pusher = None):
     installed_providers = ProvidersFactory.get_installed_providers(
         tenant_id=tenant_id, all_providers=all_providers
     )
-    logger.info("Asyncronusly pulling alerts from installed providers")
+    logger.info(
+        f"{'Asynchronously' if sync is False else 'Synchronously'} pulling alerts from installed providers"
+    )
+    sync_alerts = []  # if we're running in sync mode
     for provider in installed_providers:
         provider_class = ProvidersFactory.get_provider(
             context_manager=context_manager,
@@ -132,32 +140,43 @@ def _get_alerts_from_providers(tenant_id: str, pusher_client: Pusher = None):
                         "tenant_id": tenant_id,
                     },
                 )
-                if pusher_client:
-                    logger.info("Batch sending pulled alerts via pusher")
-                    batch_send = []
-                    previous_compressed_batch = ""
-                    new_compressed_batch = ""
-                    number_of_alerts_in_batch = 0
-                    # tb: this might be too slow in the future and we might need to refactor
-                    for alert in alerts:
-                        alert_dict = alert.dict()
-                        batch_send.append(alert_dict)
-                        new_compressed_batch = base64.b64encode(
-                            zlib.compress(json.dumps(batch_send).encode(), level=9)
-                        ).decode()
-                        if len(new_compressed_batch) <= 10240:
-                            number_of_alerts_in_batch += 1
-                            previous_compressed_batch = new_compressed_batch
-                        else:
-                            __send_compressed_alerts(
-                                previous_compressed_batch,
-                                number_of_alerts_in_batch,
-                                tenant_id,
-                                pusher_client,
-                            )
-                            batch_send = [alert_dict]
-                            new_compressed_batch = ""
-                            number_of_alerts_in_batch = 1
+                if sync:
+                    sync_alerts.extend(alerts)
+                    logger.info(
+                        f"Pulled alerts from provider {provider.type} ({provider.id}) (alerts: {len(alerts)})",
+                        extra={
+                            "provider_type": provider.type,
+                            "provider_id": provider.id,
+                            "tenant_id": tenant_id,
+                        },
+                    )
+                    continue
+
+                logger.info("Batch sending pulled alerts via pusher")
+                batch_send = []
+                previous_compressed_batch = ""
+                new_compressed_batch = ""
+                number_of_alerts_in_batch = 0
+                # tb: this might be too slow in the future and we might need to refactor
+                for alert in alerts:
+                    alert_dict = alert.dict()
+                    batch_send.append(alert_dict)
+                    new_compressed_batch = base64.b64encode(
+                        zlib.compress(json.dumps(batch_send).encode(), level=9)
+                    ).decode()
+                    if len(new_compressed_batch) <= 10240:
+                        number_of_alerts_in_batch += 1
+                        previous_compressed_batch = new_compressed_batch
+                    else:
+                        __send_compressed_alerts(
+                            previous_compressed_batch,
+                            number_of_alerts_in_batch,
+                            tenant_id,
+                            pusher_client,
+                        )
+                        batch_send = [alert_dict]
+                        new_compressed_batch = ""
+                        number_of_alerts_in_batch = 1
 
                     # this means we didn't get to this ^ else statement and loop ended
                     #   so we need to send the rest of the alerts
@@ -190,10 +209,11 @@ def _get_alerts_from_providers(tenant_id: str, pusher_client: Pusher = None):
                 },
             )
             pass
-    if not pusher_client:
-        return all_alerts
-    pusher_client.trigger(f"private-{tenant_id}", "async-done", {})
-    logger.info("Asyncronusly fetched alerts from installed providers")
+    if sync is False:
+        pusher_client.trigger(f"private-{tenant_id}", "async-done", {})
+    logger.info("Fetched alerts from installed providers")
+    if sync is True:
+        return sync_alerts
 
 
 def _get_alerts_from_db(tenant_id):
@@ -212,8 +232,9 @@ def _get_alerts_from_db(tenant_id):
 )
 def get_all_alerts(
     background_tasks: BackgroundTasks,
+    sync: bool = False,
     tenant_id: str = Depends(verify_token_or_key),
-    pusher_client: Pusher = Depends(get_pusher_client),
+    pusher_client: Pusher | None = Depends(get_pusher_client),
 ) -> list[AlertDto]:
     logger.info(
         "Fetching alerts from DB",
@@ -221,16 +242,25 @@ def get_all_alerts(
             "tenant_id": tenant_id,
         },
     )
-    alerts = _get_alerts_from_db(tenant_id)
+    db_alerts = get_alerts_from_db(tenant_id=tenant_id)
+    # enrich the alerts with the enrichment data
+    for alert in db_alerts:
+        if alert.alert_enrichment:
+            alert.event.update(alert.alert_enrichment.enrichments)
+    alerts = [AlertDto(**alert.event) for alert in db_alerts]
+    if sync:
+        alerts.extend(pull_alerts_from_providers(tenant_id, pusher_client, sync=True))
     logger.info(
         "Fetched alerts from DB",
         extra={
             "tenant_id": tenant_id,
         },
     )
-    logger.info("Adding task to fetch async alerts from providers")
-    background_tasks.add_task(_get_alerts_from_providers, tenant_id, pusher_client)
-    logger.info("Added task to async fetch alerts from providers")
+    if not sync:
+        logger.info("Adding task to fetch async alerts from providers")
+        background_tasks.add_task(pull_alerts_from_providers, tenant_id, pusher_client)
+        logger.info("Added task to async fetch alerts from providers")
+
     return alerts
 
 
@@ -238,6 +268,7 @@ def get_all_alerts(
 def delete_alert(
     delete_alert: DeleteRequestBody,
     tenant_id: str = Depends(verify_bearer_token),
+    user_email: str = Depends(get_user_email),
 ) -> dict[str, str]:
     logger.info(
         "Deleting alert",
@@ -251,7 +282,7 @@ def delete_alert(
     enrich_alert_db(
         tenant_id=tenant_id,
         fingerprint=delete_alert.fingerprint,
-        enrichments={"deleted": not delete_alert.restore},
+        enrichments={"deleted": not delete_alert.restore, "assignee": user_email},
     )
 
     logger.info(
@@ -260,6 +291,37 @@ def delete_alert(
             "tenant_id": tenant_id,
             "restore": delete_alert.restore,
             "fingerprint": delete_alert.fingerprint,
+        },
+    )
+    return {"status": "ok"}
+
+
+@router.post("/{fingerprint}/assign", description="Assign alert to user")
+def assign_alert(
+    fingerprint: str,
+    unassign: bool = False,
+    tenant_id: str = Depends(verify_bearer_token),
+    user_email: str = Depends(get_user_email),
+) -> dict[str, str]:
+    logger.info(
+        "Assigning alert",
+        extra={
+            "fingerprint": fingerprint,
+            "tenant_id": tenant_id,
+        },
+    )
+
+    enrich_alert_db(
+        tenant_id=tenant_id,
+        fingerprint=fingerprint,
+        enrichments={"assignee": user_email if not unassign else None},
+    )
+
+    logger.info(
+        "Assigned alert successfully",
+        extra={
+            "tenant_id": tenant_id,
+            "fingerprint": fingerprint,
         },
     )
     return {"status": "ok"}
@@ -294,6 +356,17 @@ def handle_formatted_events(
             )
             session.add(alert)
             formatted_event.event_id = alert.id
+            alert_enrichments = get_enrichments_from_db(
+                tenant_id=tenant_id, fingerprints=[formatted_event.fingerprint]
+            )
+            if alert_enrichments:
+                # enrich
+                for alert_enrichment in alert_enrichments:
+                    for enrichment in alert_enrichment.enrichments:
+                        # set the enrichment
+                        alert.event[enrichment] = alert_enrichment.enrichments[
+                            enrichment
+                        ]
             try:
                 pusher_client.trigger(
                     f"private-{tenant_id}",
@@ -488,9 +561,7 @@ def get_alert(
         },
     )
     # TODO: once pulled alerts will be in the db too, this should be changed
-    pushed_alerts = _get_alerts_from_db(tenant_id=tenant_id)
-    pulled_alerts = _get_alerts_from_providers(tenant_id=tenant_id)
-    all_alerts = pushed_alerts + pulled_alerts
+    all_alerts = get_all_alerts(background_tasks=None, tenant_id=tenant_id, sync=True)
     alert = list(filter(lambda alert: alert.fingerprint == fingerprint, all_alerts))
     if alert:
         return alert[0]
@@ -618,4 +689,9 @@ def get_alert_terraform(
             "tenant_id": tenant_id,
         },
     )
-    return {"terraform_definition": terraform_definition}
+    return JSONResponse(
+        content={
+            "terraformDefinition": terraform_definition,
+        },
+        status_code=200,
+    )

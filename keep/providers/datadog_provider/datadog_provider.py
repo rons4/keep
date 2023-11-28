@@ -508,6 +508,7 @@ class DatadogProvider(BaseProvider):
                         created_by=monitor.creator.email
                         if monitor and monitor.creator
                         else None,
+                        resourceId=event.monitor_id,
                     )
                     alert.fingerprint = self.get_alert_fingerprint(
                         alert, self.fingerprint_fields
@@ -661,6 +662,7 @@ class DatadogProvider(BaseProvider):
         alert.fingerprint = DatadogProvider.get_alert_fingerprint(
             alert, DatadogProvider.FINGERPRINT_FIELDS
         )
+        alert.resourceId = event.get("monitor_id")
         return alert
 
     def deploy_alert(self, alert: dict, alert_id: str | None = None):

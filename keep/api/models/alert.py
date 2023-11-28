@@ -23,12 +23,20 @@ class AlertDto(BaseModel):
         None  # The fingerprint of the alert (used for alert de-duplication)
     )
     deleted: bool = False  # Whether the alert is deleted or not
+    resourceId: str | None = None  # The resource id of the alert
 
     @validator("fingerprint", pre=True, always=True)
     def assign_fingerprint_if_none(cls, fingerprint, values):
         if fingerprint is None:
             return values.get("name", "")
         return fingerprint
+
+    # every provider can decide its own resource id
+    @validator("resourceId", pre=True, always=True)
+    def assign_resource_id_if_none(cls, resource_id, values):
+        if resource_id is None:
+            return values.get("id", "")
+        return resource_id
 
     class Config:
         extra = Extra.allow

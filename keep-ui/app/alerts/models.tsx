@@ -26,6 +26,8 @@ export interface Alert {
   generatorURL?: string;
   fingerprint: string;
   deleted?: boolean;
+  assignee?: string;
+  resourceId?: string;
 }
 
 export const AlertKnownKeys = [
@@ -48,6 +50,8 @@ export const AlertKnownKeys = [
   "ack_status",
   "deleted",
   "isDeleted", // TODO: leftover, should be removed in the future.
+  "assignee",
+  "resourceId",
 ];
 
 export const AlertTableKeys: { [key: string]: string } = {
@@ -58,6 +62,7 @@ export const AlertTableKeys: { [key: string]: string } = {
   Status: "",
   "Last Received": "",
   Source: "",
+  Assignee: "",
   "Fatigue Meter": "Calculated based on various factors",
   // "Automated workflow": "Workflows that defined to be executed automatically when this alert triggers",
   Payload: "",
